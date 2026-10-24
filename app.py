@@ -1,563 +1,615 @@
-import io
-import re
-import warnings
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-
-from sklearn.cluster import AgglomerativeClustering, DBSCAN, KMeans
-from sklearn.decomposition import PCA
+from sklearn.cluster import DBSCAN, AgglomerativeClustering, KMeans
 from sklearn.metrics import (
-    silhouette_score,
-    davies_bouldin_score,
     calinski_harabasz_score,
+    davies_bouldin_score,
+    silhouette_score,
 )
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import StandardScaler
 
-try:
-    from sklearn.cluster import HDBSCAN
-    HDBSCAN_AVAILABLE = True
-except ImportError:
-    HDBSCAN_AVAILABLE = False
+# ---------------------------------------------------------------------------
+# Konfigurasi path (struktur lama dipertahankan: results/ dan profiles/)
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+RESULTS_DIR = BASE_DIR / "results"
+PROFILES_DIR = BASE_DIR / "profiles"
+OUTPUT_DIR = BASE_DIR / "outputs"          # opsional: summary JSON + gambar
+FIGURES_DIR = OUTPUT_DIR / "figures"
 
-
-# =========================================================
-# PAGE CONFIGURATION
-# =========================================================
 st.set_page_config(
-    page_title="Customer Segmentation | RFM Analytics",
+    page_title="Customer Segmentation | RFM",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("📊 Customer Segmentation Dashboard")
-st.markdown(
-    """
-    Interactive customer segmentation using **Recency, Frequency,
-    and Monetary (RFM)** analysis with multiple clustering algorithms.
-    """
-)
 
-st.caption(
-    "Upload transaction data or an existing RFM table to run your own experiment."
-)
-
-
-# =========================================================
-# DATA LOADING AND COLUMN NORMALIZATION
-# =========================================================
-def normalize_column_name(name):
-    name = str(name).strip().lower()
-    name = re.sub(r"[_\-]+", " ", name)
-    return re.sub(r"\s+", " ", name)
+# ---------------------------------------------------------------------------
+# Helper pembaca file (aman jika file tidak ada)
+# ---------------------------------------------------------------------------
+@st.cache_data
+def load_csv(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return pd.read_csv(path)
+    except (OSError, pd.errors.ParserError, UnicodeDecodeError):
+        return None
 
 
-def normalize_columns(df):
-    df = df.copy()
-    df.columns = [normalize_column_name(c) for c in df.columns]
+def load_experiment_summary():
+    path = OUTPUT_DIR / "experiment_summary.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
 
-    aliases = {
-        "invoice": ["invoice", "invoiceno", "invoice no", "invoice number"],
-        "customer id": [
-            "customer id", "customerid", "customer", "customer number"
-        ],
-        "invoice date": ["invoice date", "invoicedate", "date", "transaction date"],
-        "quantity": ["quantity", "qty"],
-        "price": ["price", "unit price", "unitprice", "unit cost"],
-        "recency": ["recency", "r"],
-        "frequency": ["frequency", "freq", "f"],
-        "monetary": ["monetary", "monetary value", "spend", "total spend", "m"],
+
+# ---------------------------------------------------------------------------
+# HALAMAN 1: OVERVIEW DASHBOARD (hasil eksperimen tersimpan)
+# ---------------------------------------------------------------------------
+def render_overview():
+    st.title("📊 Customer Segmentation Dashboard")
+    st.caption(
+        "Perbandingan K-Means, Agglomerative Clustering, dan DBSCAN "
+        "untuk segmentasi pelanggan berbasis RFM"
+    )
+
+    files = {
+        "kmeans_results": RESULTS_DIR / "results_kmeans.csv",
+        "agg_results": RESULTS_DIR / "results_agglomerative.csv",
+        "dbscan_results": RESULTS_DIR / "results_dbscan.csv",
+        "kmeans_profile": PROFILES_DIR / "profile_kmeans_2.csv",
+        "kmeans4_profile": PROFILES_DIR / "profile_kmeans_4.csv",
+        "agg_profile": PROFILES_DIR / "profile_agglomerative_2.csv",
+        "dbscan_profile": PROFILES_DIR / "profile_dbscan.csv",
     }
-
-    rename = {}
-    for standard_name, possible_names in aliases.items():
-        for name in possible_names:
-            if name in df.columns:
-                rename[name] = standard_name
-                break
-
-    return df.rename(columns=rename)
-
-
-@st.cache_data(show_spinner=False)
-def read_uploaded_file(file_bytes, filename):
-    buffer = io.BytesIO(file_bytes)
-
-    if filename.lower().endswith(".csv"):
-        try:
-            return pd.read_csv(buffer, low_memory=False)
-        except UnicodeDecodeError:
-            buffer.seek(0)
-            return pd.read_csv(buffer, encoding="latin-1", low_memory=False)
-
-    if filename.lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(buffer)
-
-    raise ValueError("Unsupported file format.")
-
-
-def build_rfm(df):
-    """Accept raw transactions or a precomputed RFM table."""
-    df = normalize_columns(df)
-
-    required_rfm = {"recency", "frequency", "monetary"}
-
-    # Case 1: the uploaded file already contains RFM metrics.
-    if required_rfm.issubset(df.columns):
-        rfm = df.copy()
-
-        if "customer id" not in rfm.columns:
-            rfm.insert(0, "customer id", np.arange(1, len(rfm) + 1))
-
-        rfm = rfm[["customer id", "recency", "frequency", "monetary"]]
-
-        for col in ["recency", "frequency", "monetary"]:
-            rfm[col] = pd.to_numeric(rfm[col], errors="coerce")
-
-        rfm = rfm.replace([np.inf, -np.inf], np.nan).dropna(
-            subset=["recency", "frequency", "monetary"]
-        )
-
-        rfm = rfm[
-            (rfm["recency"] >= 0)
-            & (rfm["frequency"] > 0)
-            & (rfm["monetary"] >= 0)
-        ]
-
-        rfm = rfm.drop_duplicates(subset=["customer id"], keep="first")
-        return rfm.reset_index(drop=True), "RFM table"
-
-    # Case 2: raw transaction data.
-    required_transactions = {
-        "invoice", "customer id", "invoice date", "quantity", "price"
-    }
-
-    missing = required_transactions - set(df.columns)
+    data = {name: load_csv(path) for name, path in files.items()}
+    missing = [str(files[n].relative_to(BASE_DIR)) for n, d in data.items() if d is None]
     if missing:
-        raise ValueError(
-            "Kolom tidak dikenali. Upload tabel RFM dengan kolom "
-            "Recency, Frequency, Monetary, atau data transaksi yang memiliki "
-            "Invoice, Customer ID, InvoiceDate, Quantity, dan Price. "
-            f"Kolom yang belum ditemukan: {', '.join(sorted(missing))}"
+        st.error(
+            "File hasil eksperimen berikut tidak ditemukan atau tidak dapat dibaca:\n\n"
+            + "\n".join(f"- `{m}`" for m in missing)
         )
+        st.stop()
 
-    df["customer id"] = df["customer id"].astype("string").str.strip()
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["invoice date"] = pd.to_datetime(
-        df["invoice date"], errors="coerce", dayfirst=True
+    kmeans_results = data["kmeans_results"]
+    agg_results = data["agg_results"]
+    dbscan_results = data["dbscan_results"]
+    kmeans_profile = data["kmeans_profile"]
+    kmeans4_profile = data["kmeans4_profile"]
+    agg_profile = data["agg_profile"]
+    dbscan_profile = data["dbscan_profile"]
+
+    # Konfigurasi terbaik dari hasil eksperimen tersimpan
+    best_kmeans = kmeans_results.loc[kmeans_results["silhouette"].idxmax()]
+    best_agg = agg_results.loc[agg_results["silhouette"].idxmax()]
+    best_dbscan = dbscan_results.loc[dbscan_results["silhouette"].idxmax()]
+
+    comparison = pd.DataFrame([
+        {
+            "Model": f"K-Means (k={int(best_kmeans['k'])})",
+            "Silhouette": best_kmeans["silhouette"],
+            "Davies-Bouldin": best_kmeans["davies_bouldin"],
+            "Calinski-Harabasz": best_kmeans["calinski_harabasz"],
+            "Noise (%)": 0.0,
+        },
+        {
+            "Model": f"Agglomerative (k={int(best_agg['k'])})",
+            "Silhouette": best_agg["silhouette"],
+            "Davies-Bouldin": best_agg["davies_bouldin"],
+            "Calinski-Harabasz": best_agg["calinski_harabasz"],
+            "Noise (%)": 0.0,
+        },
+        {
+            "Model": (
+                f"DBSCAN (eps={best_dbscan['eps']:.2f}, "
+                f"min_samples={int(best_dbscan['min_samples'])})"
+            ),
+            "Silhouette": best_dbscan["silhouette"],
+            "Davies-Bouldin": best_dbscan["davies_bouldin"],
+            "Calinski-Harabasz": best_dbscan["calinski_harabasz"],
+            "Noise (%)": best_dbscan["noise_percentage"],
+        },
+    ])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pelanggan dianalisis", "5.878")
+    c2.metric("Transaksi valid", "779.425")
+    c3.metric("Algoritma dibandingkan", "3")
+
+    st.divider()
+
+    # --- 1. Perbandingan model ---------------------------------------------
+    st.header("1. Perbandingan Model")
+    st.markdown(
+        "Silhouette dan Calinski-Harabasz yang lebih tinggi umumnya lebih baik, "
+        "sedangkan Davies-Bouldin yang lebih rendah umumnya lebih baik."
     )
 
-    df = df.dropna(
-        subset=["customer id", "invoice", "invoice date", "quantity", "price"]
+    st.dataframe(
+        comparison.style.format({
+            "Silhouette": "{:.4f}",
+            "Davies-Bouldin": "{:.4f}",
+            "Calinski-Harabasz": "{:,.2f}",
+            "Noise (%)": "{:.2f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
     )
 
-    df = df[
-        (df["customer id"] != "")
-        & (df["quantity"] > 0)
-        & (df["price"] > 0)
-    ].copy()
-
-    # Exclude cancelled invoices, such as invoices beginning with C.
-    df = df[
-        ~df["invoice"].astype(str).str.strip().str.upper().str.startswith("C")
-    ].copy()
-
-    if df.empty:
-        raise ValueError(
-            "Tidak ada transaksi valid setelah proses pembersihan data."
-        )
-
-    df["sales"] = df["quantity"] * df["price"]
-    reference_date = df["invoice date"].max().normalize() + pd.Timedelta(days=1)
-
-    rfm = (
-        df.groupby("customer id", as_index=False)
-        .agg(
-            last_purchase=("invoice date", "max"),
-            frequency=("invoice", "nunique"),
-            monetary=("sales", "sum"),
-        )
+    metric_choice = st.selectbox(
+        "Pilih metrik untuk grafik perbandingan",
+        ["Silhouette", "Davies-Bouldin", "Calinski-Harabasz"],
     )
-
-    rfm["recency"] = (
-        reference_date - rfm["last_purchase"].dt.normalize()
-    ).dt.days
-
-    rfm = rfm[
-        ["customer id", "recency", "frequency", "monetary"]
-    ].replace([np.inf, -np.inf], np.nan).dropna()
-
-    rfm = rfm[
-        (rfm["recency"] >= 0)
-        & (rfm["frequency"] > 0)
-        & (rfm["monetary"] >= 0)
-    ]
-
-    return rfm.reset_index(drop=True), "Raw transactions"
-
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-with st.sidebar:
-    st.header("⚙️ Experiment Settings")
-
-    algorithm = st.selectbox(
-        "Clustering algorithm",
-        ["K-Means", "Agglomerative", "DBSCAN"] +
-        (["HDBSCAN"] if HDBSCAN_AVAILABLE else []),
+    fig_comparison = px.bar(
+        comparison,
+        x="Model",
+        y=metric_choice,
+        color="Model",
+        title=f"Perbandingan model berdasarkan {metric_choice}",
+        text_auto=".4f",
     )
-
-    if algorithm in ["K-Means", "Agglomerative"]:
-        n_clusters = st.slider(
-            "Number of clusters",
-            min_value=2,
-            max_value=10,
-            value=4,
-        )
-    elif algorithm == "DBSCAN":
-        eps = st.slider(
-            "DBSCAN eps",
-            min_value=0.1,
-            max_value=3.0,
-            value=0.8,
-            step=0.1,
-        )
-        min_samples = st.slider(
-            "DBSCAN min_samples",
-            min_value=2,
-            max_value=20,
-            value=5,
-        )
-    else:
-        min_cluster_size = st.slider(
-            "HDBSCAN min_cluster_size",
-            min_value=5,
-            max_value=50,
-            value=10,
-        )
-        min_samples_hdb = st.slider(
-            "HDBSCAN min_samples",
-            min_value=2,
-            max_value=20,
-            value=5,
-        )
+    fig_comparison.update_layout(showlegend=False)
+    st.plotly_chart(fig_comparison, use_container_width=True)
 
     st.info(
-        "RFM features are log-transformed and scaled before clustering. "
-        "The displayed cluster labels are algorithm-generated labels."
+        "Pada eksperimen ini, K-Means k=2 memberikan hasil terbaik pada "
+        "ketiga metrik evaluasi internal dibandingkan konfigurasi terpilih "
+        "dari dua algoritma lainnya."
     )
 
+    # --- Hasil eksperimen lengkap (tabel + unduh) ---------------------------
+    with st.expander("Lihat semua hasil eksperimen per algoritma"):
+        for name, df in [
+            ("K-Means", kmeans_results),
+            ("Agglomerative", agg_results),
+            ("DBSCAN", dbscan_results),
+        ]:
+            st.markdown(f"**{name}**")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.download_button(
+                f"Unduh hasil {name}",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"results_{name.lower()}.csv",
+                mime="text/csv",
+                key=f"download_overview_{name}",
+            )
 
-# =========================================================
-# UPLOAD DATA
-# =========================================================
-uploaded_file = st.file_uploader(
-    "Upload a transaction dataset or RFM CSV/Excel file",
-    type=["csv", "xlsx", "xls"],
-    help="For raw transactions, use Online Retail II-style columns. "
-         "For RFM data, include Recency, Frequency, and Monetary.",
-    max_upload_size=200,
-)
+    # Ringkasan JSON opsional (folder outputs/)
+    summary = load_experiment_summary()
+    if summary is not None:
+        with st.expander("Ringkasan eksperimen (experiment_summary.json)"):
+            st.json(summary, expanded=False)
 
-if uploaded_file is None:
-    st.info("Upload a CSV or Excel file to start the analysis.")
+    st.divider()
 
-    st.markdown("### Expected input formats")
+    # --- 2. Profil segmen ---------------------------------------------------
+    st.header("2. Eksplorasi Profil Segmen Pelanggan")
 
-    with st.expander("Raw transaction data"):
-        st.code(
-            "Invoice | Customer ID | InvoiceDate | Quantity | Price\n"
-            "536365  | 17850       | 2010-12-01 | 6        | 2.55",
-            language="text",
-        )
-
-    with st.expander("Precomputed RFM data"):
-        st.code(
-            "CustomerID | Recency | Frequency | Monetary\n"
-            "17850      | 12      | 8         | 1500.50",
-            language="text",
-        )
-
-    st.stop()
-
-
-# =========================================================
-# PREPARE RFM
-# =========================================================
-try:
-    raw_df = read_uploaded_file(
-        uploaded_file.getvalue(),
-        uploaded_file.name,
+    model_choice = st.selectbox(
+        "Pilih hasil segmentasi",
+        [
+            "K-Means (k=2)",
+            "K-Means (k=4)",
+            "Agglomerative (k=2)",
+            "DBSCAN (eps=0.45)",
+        ],
     )
-    rfm, input_type = build_rfm(raw_df)
-except Exception as exc:
-    st.error(f"Gagal membaca atau memproses dataset: {exc}")
-    st.stop()
 
-if len(rfm) < 3:
-    st.error("Diperlukan minimal 3 pelanggan valid untuk clustering.")
-    st.stop()
+    profiles = {
+        "K-Means (k=2)": (kmeans_profile, "Cluster_KMeans_2"),
+        "K-Means (k=4)": (kmeans4_profile, "Cluster_KMeans_4"),
+        "Agglomerative (k=2)": (agg_profile, "Cluster_Agglomerative_2"),
+        "DBSCAN (eps=0.45)": (dbscan_profile, "Cluster_DBSCAN"),
+    }
+    interpretations = {
+        "K-Means (k=2)": {0: "Inactive / Low-Value", 1: "Active / High-Value"},
+        "Agglomerative (k=2)": {0: "Active / High-Value", 1: "Inactive / Low-Value"},
+        "DBSCAN (eps=0.45)": {
+            0: "Relatively Active / Higher-Value",
+            1: "Inactive / Low-Value",
+        },
+        "K-Means (k=4)": {
+            0: "Very Inactive / Low-Value",
+            1: "Recently Active / Lower Frequency",
+            2: "Active / High-Value",
+            3: "Moderate Activity / Value",
+        },
+    }
 
-st.success(
-    f"Data berhasil diproses sebagai {input_type}. "
-    f"Jumlah pelanggan valid: {len(rfm):,}."
-)
+    profile, cluster_col = profiles[model_choice]
+    display_profile = profile.copy()
+    display_profile["Interpretasi"] = display_profile[cluster_col].map(
+        interpretations[model_choice]
+    )
 
-with st.expander("Preview RFM data"):
-    st.dataframe(rfm.head(20), use_container_width=True)
-
-
-# =========================================================
-# RFM SUMMARY
-# =========================================================
-st.subheader("📌 RFM Overview")
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Customers", f"{len(rfm):,}")
-c2.metric("Average Recency", f"{rfm['recency'].mean():,.1f} days")
-c3.metric("Average Frequency", f"{rfm['frequency'].mean():,.1f}")
-c4.metric("Total Monetary", f"{rfm['monetary'].sum():,.2f}")
-
-with st.expander("RFM descriptive statistics"):
     st.dataframe(
-        rfm[["recency", "frequency", "monetary"]].describe().T,
+        display_profile.style.format({
+            "Recency_Mean": "{:.2f}",
+            "Recency_Median": "{:.2f}",
+            "Frequency_Mean": "{:.2f}",
+            "Frequency_Median": "{:.2f}",
+            "Monetary_Mean": "{:,.2f}",
+            "Monetary_Median": "{:,.2f}",
+            "Customer_Percentage": "{:.2f}%",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    pie_df = profile.copy()
+    pie_df[cluster_col] = pie_df[cluster_col].astype(str)
+    fig_size = px.pie(
+        pie_df,
+        names=cluster_col,
+        values="Customer_Count",
+        title=f"Distribusi pelanggan — {model_choice}",
+        hole=0.4,
+    )
+    st.plotly_chart(fig_size, use_container_width=True)
+
+    bar_df = display_profile.copy()
+    bar_df[cluster_col] = bar_df[cluster_col].astype(str)
+    fig_rfm = px.bar(
+        bar_df,
+        x=cluster_col,
+        y=["Recency_Mean", "Frequency_Mean", "Monetary_Mean"],
+        barmode="group",
+        title="Perbandingan rata-rata RFM per cluster",
+        labels={"value": "Nilai rata-rata", "variable": "Variabel RFM"},
+    )
+    st.plotly_chart(fig_rfm, use_container_width=True)
+
+    if model_choice == "DBSCAN (eps=0.45)":
+        st.warning(
+            "Profil DBSCAN mencakup 5.807 pelanggan dalam dua cluster. "
+            "Sebanyak 71 pelanggan (sekitar 1,21%) dikategorikan sebagai noise "
+            "dan tidak tercantum dalam file profil cluster."
+        )
+
+    # Gambar opsional dari outputs/figures
+    if FIGURES_DIR.exists():
+        images = sorted(
+            p for p in FIGURES_DIR.iterdir()
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        )
+        if images:
+            with st.expander(f"Galeri gambar hasil eksperimen ({len(images)})"):
+                chosen = st.multiselect(
+                    "Pilih gambar",
+                    [p.name for p in images],
+                    default=[images[0].name],
+                )
+                for p in images:
+                    if p.name in chosen:
+                        st.image(str(p), caption=p.name, use_container_width=True)
+
+    st.divider()
+
+    # --- 3. Interpretasi bisnis --------------------------------------------
+    st.header("3. Interpretasi Bisnis")
+
+    st.subheader("Active / High-Value Customers")
+    st.markdown(
+        "- Pertahankan pelanggan melalui program loyalitas.\n"
+        "- Tawarkan promosi yang relevan berdasarkan riwayat pembelian.\n"
+        "- Berikan penghargaan kepada pelanggan dengan frekuensi dan nilai "
+        "transaksi tinggi."
+    )
+
+    st.subheader("Inactive / Low-Value Customers")
+    st.markdown(
+        "- Jalankan kampanye reaktivasi pelanggan.\n"
+        "- Berikan voucher atau penawaran khusus secara terukur.\n"
+        "- Gunakan pengingat dan rekomendasi produk untuk mendorong pembelian ulang."
+    )
+
+    st.caption(
+        "Catatan: nama segmen merupakan interpretasi berdasarkan karakteristik "
+        "RFM. Nominal Monetary mengikuti satuan mata uang pada dataset sumber. "
+        "Label cluster adalah label teknis dan tidak menunjukkan urutan nilai."
+    )
+
+
+# ---------------------------------------------------------------------------
+# HALAMAN 2: EXPLORE DATASET (upload + clustering baru)
+# ---------------------------------------------------------------------------
+def read_uploaded(file):
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(file)
+    return pd.read_excel(file)  # butuh openpyxl
+
+
+def build_rfm_from_transactions(df, cust_col, date_col, inv_col, qty_col, price_col):
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    work[qty_col] = pd.to_numeric(work[qty_col], errors="coerce")
+    work[price_col] = pd.to_numeric(work[price_col], errors="coerce")
+    work = work.dropna(subset=[cust_col, date_col, qty_col, price_col])
+    work = work[(work[qty_col] > 0) & (work[price_col] > 0)]
+    if work.empty:
+        return None
+
+    work["_amount"] = work[qty_col] * work[price_col]
+    snapshot = work[date_col].max() + pd.Timedelta(days=1)
+
+    grouped = work.groupby(cust_col)
+    rfm = pd.DataFrame({
+        "Recency": (snapshot - grouped[date_col].max()).dt.days,
+        "Frequency": (
+            grouped[inv_col].nunique() if inv_col else grouped[date_col].nunique()
+        ),
+        "Monetary": grouped["_amount"].sum(),
+    }).reset_index().rename(columns={cust_col: "CustomerID"})
+    return rfm
+
+
+def build_profile(df, label_col):
+    prof = df.groupby(label_col).agg(
+        Customer_Count=("Recency", "size"),
+        Recency_Mean=("Recency", "mean"),
+        Recency_Median=("Recency", "median"),
+        Frequency_Mean=("Frequency", "mean"),
+        Frequency_Median=("Frequency", "median"),
+        Monetary_Mean=("Monetary", "mean"),
+        Monetary_Median=("Monetary", "median"),
+    ).reset_index()
+    prof["Customer_Percentage"] = prof["Customer_Count"] / prof["Customer_Count"].sum() * 100
+    return prof
+
+
+def run_clustering(rfm, algo, params, use_log):
+    values = rfm[["Recency", "Frequency", "Monetary"]].astype(float).clip(lower=0)
+    if use_log:
+        values = np.log1p(values)
+    X = StandardScaler().fit_transform(values)
+
+    if algo == "K-Means":
+        model = KMeans(n_clusters=params["k"], n_init=10, random_state=42)
+    elif algo == "Agglomerative":
+        model = AgglomerativeClustering(
+            n_clusters=params["k"], linkage=params["linkage"]
+        )
+    else:
+        model = DBSCAN(eps=params["eps"], min_samples=params["min_samples"])
+
+    labels = model.fit_predict(X)
+
+    mask = labels != -1
+    n_clusters = len(set(labels[mask]))
+    metrics = {
+        "Jumlah cluster": n_clusters,
+        "Noise (%)": float((~mask).mean() * 100),
+        "Silhouette": None,
+        "Davies-Bouldin": None,
+        "Calinski-Harabasz": None,
+    }
+    if n_clusters >= 2 and mask.sum() > n_clusters:
+        Xm, lm = X[mask], labels[mask]
+        sample = min(10000, len(Xm)) if len(Xm) > 10000 else None
+        metrics["Silhouette"] = float(
+            silhouette_score(Xm, lm, sample_size=sample, random_state=42)
+        )
+        metrics["Davies-Bouldin"] = float(davies_bouldin_score(Xm, lm))
+        metrics["Calinski-Harabasz"] = float(calinski_harabasz_score(Xm, lm))
+    return labels, metrics
+
+
+def render_explore_dataset():
+    st.title("🔎 Explore Dataset")
+    st.caption(
+        "Unggah dataset Anda sendiri, pilih algoritma clustering, jalankan "
+        "eksperimen, lalu unduh hasilnya."
+    )
+
+    # --- 1. Upload ----------------------------------------------------------
+    st.header("1. Unggah Data")
+    uploaded = st.file_uploader("Unggah file CSV atau Excel", type=["csv", "xlsx"])
+    if uploaded is None:
+        st.info("Unggah dataset untuk memulai.")
+        return
+
+    try:
+        raw = read_uploaded(uploaded)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"File tidak dapat dibaca: {exc}")
+        return
+
+    st.write(f"{len(raw):,} baris, {raw.shape[1]} kolom")
+    st.dataframe(raw.head(20), use_container_width=True)
+
+    cols = raw.columns.tolist()
+    mode = st.radio(
+        "Jenis data",
+        ["Data RFM siap pakai", "Data transaksi mentah"],
+        horizontal=True,
+    )
+
+    # --- 2. Mapping kolom ---------------------------------------------------
+    st.header("2. Pilih Kolom")
+    rfm = None
+
+    if mode == "Data RFM siap pakai":
+        c1, c2, c3, c4 = st.columns(4)
+        id_col = c1.selectbox("Kolom ID pelanggan (opsional)", ["(tidak ada)"] + cols)
+        r_col = c2.selectbox("Recency", cols)
+        f_col = c3.selectbox("Frequency", cols, index=min(1, len(cols) - 1))
+        m_col = c4.selectbox("Monetary", cols, index=min(2, len(cols) - 1))
+
+        if len({r_col, f_col, m_col}) < 3:
+            st.warning("Kolom Recency, Frequency, dan Monetary harus berbeda.")
+            return
+
+        rfm = pd.DataFrame({
+            "Recency": pd.to_numeric(raw[r_col], errors="coerce"),
+            "Frequency": pd.to_numeric(raw[f_col], errors="coerce"),
+            "Monetary": pd.to_numeric(raw[m_col], errors="coerce"),
+        })
+        if id_col != "(tidak ada)":
+            rfm.insert(0, "CustomerID", raw[id_col].values)
+        rfm = rfm.dropna(subset=["Recency", "Frequency", "Monetary"]).reset_index(drop=True)
+    else:
+        c1, c2, c3 = st.columns(3)
+        cust_col = c1.selectbox("Kolom ID pelanggan", cols)
+        date_col = c2.selectbox("Kolom tanggal transaksi", cols)
+        inv_col = c3.selectbox("Kolom nomor invoice (opsional)", ["(tidak ada)"] + cols)
+        c4, c5 = st.columns(2)
+        qty_col = c4.selectbox("Kolom jumlah (Quantity)", cols)
+        price_col = c5.selectbox("Kolom harga satuan (Price)", cols)
+
+        if len({cust_col, date_col, qty_col, price_col}) < 4:
+            st.warning("Pilih kolom yang berbeda untuk setiap peran.")
+            return
+
+        rfm = build_rfm_from_transactions(
+            raw, cust_col, date_col,
+            None if inv_col == "(tidak ada)" else inv_col,
+            qty_col, price_col,
+        )
+
+    if rfm is None or rfm.empty:
+        st.error("Tidak ada data valid setelah pembersihan. Periksa pemilihan kolom.")
+        return
+
+    st.success(f"Data RFM siap: {len(rfm):,} pelanggan/baris.")
+    with st.expander("Lihat tabel RFM"):
+        st.dataframe(rfm.head(100), use_container_width=True, hide_index=True)
+
+    # --- 3. Pengaturan algoritma -------------------------------------------
+    st.header("3. Pengaturan Clustering")
+    algo = st.selectbox("Algoritma", ["K-Means", "Agglomerative", "DBSCAN"])
+    use_log = st.checkbox(
+        "Transformasi log1p sebelum standardisasi (disarankan untuk data RFM yang miring)",
+        value=True,
+    )
+
+    params = {}
+    if algo in ("K-Means", "Agglomerative"):
+        params["k"] = st.slider("Jumlah cluster (k)", 2, 10, 2)
+    if algo == "Agglomerative":
+        params["linkage"] = st.selectbox("Linkage", ["ward", "complete", "average", "single"])
+        if len(rfm) > 15000:
+            st.warning(
+                "Agglomerative pada data besar membutuhkan banyak memori dan waktu. "
+                "Pertimbangkan K-Means atau sampling data."
+            )
+    if algo == "DBSCAN":
+        c1, c2 = st.columns(2)
+        params["eps"] = c1.slider("eps", 0.05, 3.0, 0.45, 0.05)
+        params["min_samples"] = c2.slider("min_samples", 2, 50, 5)
+
+    if st.button("Jalankan clustering", type="primary"):
+        with st.spinner("Menjalankan clustering..."):
+            try:
+                labels, metrics = run_clustering(rfm, algo, params, use_log)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Clustering gagal: {exc}")
+                return
+        st.session_state["explore_result"] = {
+            "rfm": rfm.assign(Cluster=labels),
+            "metrics": metrics,
+            "algo": algo,
+            "params": params,
+        }
+
+    # --- 4. Hasil -----------------------------------------------------------
+    result = st.session_state.get("explore_result")
+    if result is None:
+        return
+
+    st.header("4. Hasil")
+    seg = result["rfm"]
+    metrics = result["metrics"]
+    st.caption(f"Algoritma: {result['algo']} — parameter: {result['params']}")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Jumlah cluster", metrics["Jumlah cluster"])
+    m2.metric("Noise (%)", f"{metrics['Noise (%)']:.2f}")
+    m3.metric("Silhouette", "—" if metrics["Silhouette"] is None else f"{metrics['Silhouette']:.4f}")
+    m4.metric("Davies-Bouldin", "—" if metrics["Davies-Bouldin"] is None else f"{metrics['Davies-Bouldin']:.4f}")
+    m5.metric("Calinski-Harabasz", "—" if metrics["Calinski-Harabasz"] is None else f"{metrics['Calinski-Harabasz']:,.2f}")
+
+    if metrics["Silhouette"] is None:
+        st.warning(
+            "Metrik evaluasi tidak dapat dihitung karena hasil memiliki kurang "
+            "dari 2 cluster (di luar noise). Coba ubah parameter."
+        )
+
+    prof = build_profile(seg, "Cluster")
+    st.subheader("Profil cluster")
+    st.dataframe(
+        prof.style.format({
+            "Recency_Mean": "{:.2f}",
+            "Recency_Median": "{:.2f}",
+            "Frequency_Mean": "{:.2f}",
+            "Frequency_Median": "{:.2f}",
+            "Monetary_Mean": "{:,.2f}",
+            "Monetary_Median": "{:,.2f}",
+            "Customer_Percentage": "{:.2f}%",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    if (seg["Cluster"] == -1).any():
+        st.caption("Cluster -1 pada DBSCAN adalah noise (bukan segmen).")
+
+    plot_prof = prof.copy()
+    plot_prof["Cluster"] = plot_prof["Cluster"].astype(str)
+    g1, g2 = st.columns(2)
+    g1.plotly_chart(
+        px.pie(plot_prof, names="Cluster", values="Customer_Count",
+               title="Distribusi pelanggan", hole=0.4),
+        use_container_width=True,
+    )
+    g2.plotly_chart(
+        px.bar(plot_prof, x="Cluster",
+               y=["Recency_Mean", "Frequency_Mean", "Monetary_Mean"],
+               barmode="group", title="Rata-rata RFM per cluster",
+               labels={"value": "Nilai rata-rata", "variable": "Variabel RFM"}),
         use_container_width=True,
     )
 
-
-# =========================================================
-# CLUSTERING
-# =========================================================
-st.subheader(f"🧪 Run {algorithm} clustering")
-
-if st.button("Run Clustering", type="primary", use_container_width=True):
-    with st.spinner("Preparing features and running clustering..."):
-        feature_cols = ["recency", "frequency", "monetary"]
-        X = rfm[feature_cols].to_numpy(dtype=float)
-
-        # RFM values are usually right-skewed.
-        X_log = np.log1p(np.clip(X, a_min=0, a_max=None))
-        scaler = RobustScaler()
-        X_scaled = scaler.fit_transform(X_log)
-
-        try:
-            if algorithm == "K-Means":
-                if len(rfm) <= n_clusters:
-                    st.error("Jumlah pelanggan harus lebih besar dari jumlah cluster.")
-                    st.stop()
-
-                model = KMeans(
-                    n_clusters=n_clusters,
-                    random_state=42,
-                    n_init=10,
-                )
-                labels = model.fit_predict(X_scaled)
-
-            elif algorithm == "Agglomerative":
-                if len(rfm) <= n_clusters:
-                    st.error("Jumlah pelanggan harus lebih besar dari jumlah cluster.")
-                    st.stop()
-
-                model = AgglomerativeClustering(n_clusters=n_clusters)
-                labels = model.fit_predict(X_scaled)
-
-            elif algorithm == "DBSCAN":
-                model = DBSCAN(
-                    eps=eps,
-                    min_samples=min_samples,
-                )
-                labels = model.fit_predict(X_scaled)
-
-            else:
-                model = HDBSCAN(
-                    min_cluster_size=min_cluster_size,
-                    min_samples=min_samples_hdb,
-                )
-                labels = model.fit_predict(X_scaled)
-
-        except Exception as exc:
-            st.error(f"Clustering gagal: {exc}")
-            st.stop()
-
-        result = rfm.copy()
-        result["cluster"] = labels
-
-        # Evaluation excludes DBSCAN/HDBSCAN noise (-1).
-        valid_mask = labels != -1
-        valid_labels = labels[valid_mask]
-        valid_X = X_scaled[valid_mask]
-        unique_valid = np.unique(valid_labels)
-
-        silhouette = np.nan
-        davies_bouldin = np.nan
-        calinski_harabasz = np.nan
-
-        if 2 <= len(unique_valid) < len(valid_labels):
-            try:
-                silhouette = silhouette_score(valid_X, valid_labels)
-                davies_bouldin = davies_bouldin_score(valid_X, valid_labels)
-                calinski_harabasz = calinski_harabasz_score(
-                    valid_X, valid_labels
-                )
-            except Exception:
-                pass
-
-        # PCA projection for visualization.
-        pca = PCA(n_components=2, random_state=42)
-        coordinates = pca.fit_transform(X_scaled)
-        result["PCA 1"] = coordinates[:, 0]
-        result["PCA 2"] = coordinates[:, 1]
-        result["cluster_name"] = result["cluster"].map(
-            lambda x: "Noise / Outlier" if x == -1 else f"Cluster {x}"
-        )
-
-        st.session_state["rfm_cluster_result"] = result
-        st.session_state["rfm_cluster_algorithm"] = algorithm
-        st.session_state["rfm_cluster_metrics"] = {
-            "silhouette": silhouette,
-            "davies_bouldin": davies_bouldin,
-            "calinski_harabasz": calinski_harabasz,
-            "noise_count": int(np.sum(labels == -1)),
-            "cluster_count": int(len(np.unique(labels[labels != -1]))),
-            "pca_variance": float(pca.explained_variance_ratio_.sum()),
-        }
-
-
-# =========================================================
-# RESULTS
-# =========================================================
-if "rfm_cluster_result" in st.session_state:
-    result = st.session_state["rfm_cluster_result"]
-    metrics = st.session_state["rfm_cluster_metrics"]
-    result_algorithm = st.session_state["rfm_cluster_algorithm"]
-
-    st.divider()
-    st.header(f"📈 Results — {result_algorithm}")
-
-    m1, m2, m3, m4 = st.columns(4)
-
-    silhouette_value = metrics["silhouette"]
-    db_value = metrics["davies_bouldin"]
-    ch_value = metrics["calinski_harabasz"]
-
-    m1.metric(
-        "Silhouette Score",
-        f"{silhouette_value:.4f}" if np.isfinite(silhouette_value) else "N/A",
-    )
-    m2.metric(
-        "Davies–Bouldin Index",
-        f"{db_value:.4f}" if np.isfinite(db_value) else "N/A",
-    )
-    m3.metric(
-        "Calinski–Harabasz",
-        f"{ch_value:,.2f}" if np.isfinite(ch_value) else "N/A",
-    )
-    m4.metric("Detected clusters", metrics["cluster_count"])
-
-    if result_algorithm in ["DBSCAN", "HDBSCAN"]:
-        st.caption(
-            f"Noise/outlier points: {metrics['noise_count']:,}. "
-            "Noise is excluded from the clustering quality metrics."
-        )
-
-    left, right = st.columns(2)
-
-    with left:
-        cluster_counts = (
-            result["cluster_name"]
-            .value_counts()
-            .rename_axis("Cluster")
-            .reset_index(name="Customers")
-        )
-        fig_counts = px.bar(
-            cluster_counts,
-            x="Cluster",
-            y="Customers",
-            title="Customer Distribution by Cluster",
-            text="Customers",
-        )
-        st.plotly_chart(fig_counts, use_container_width=True)
-
-    with right:
-        fig_pca = px.scatter(
-            result,
-            x="PCA 1",
-            y="PCA 2",
-            color="cluster_name",
-            hover_data=["customer id", "recency", "frequency", "monetary"],
-            title="Cluster Visualization — PCA",
-            opacity=0.75,
-        )
-        st.plotly_chart(fig_pca, use_container_width=True)
-
-    st.subheader("Customer Segment Profiles")
-
-    profile = (
-        result.groupby("cluster_name", as_index=False)
-        .agg(
-            customers=("customer id", "count"),
-            avg_recency=("recency", "mean"),
-            avg_frequency=("frequency", "mean"),
-            avg_monetary=("monetary", "mean"),
-            total_monetary=("monetary", "sum"),
-        )
-        .sort_values("customers", ascending=False)
+    plot_df = seg.sample(min(5000, len(seg)), random_state=42).copy()
+    plot_df["Cluster"] = plot_df["Cluster"].astype(str)
+    st.plotly_chart(
+        px.scatter(plot_df, x="Frequency", y="Monetary", color="Cluster",
+                   log_x=True, log_y=True, opacity=0.6,
+                   title="Sebaran Frequency vs Monetary (skala log, maks. 5.000 titik)"),
+        use_container_width=True,
     )
 
-    profile["customer_percentage"] = (
-        profile["customers"] / len(result) * 100
-    ).round(2)
-
-    for col in ["avg_recency", "avg_frequency", "avg_monetary", "total_monetary"]:
-        profile[col] = profile[col].round(2)
-
-    st.dataframe(profile, use_container_width=True, hide_index=True)
-
-    st.subheader("Segment Interpretation")
-    st.caption(
-        "Interpretation is based on observed RFM averages. Cluster numbers "
-        "are arbitrary labels, not an inherent ranking of customer value."
+    st.subheader("Unduh hasil")
+    d1, d2 = st.columns(2)
+    d1.download_button(
+        "Unduh data segmentasi (CSV)",
+        data=seg.to_csv(index=False).encode("utf-8"),
+        file_name="rfm_segments.csv",
+        mime="text/csv",
+    )
+    d2.download_button(
+        "Unduh profil cluster (CSV)",
+        data=prof.to_csv(index=False).encode("utf-8"),
+        file_name="profile_cluster.csv",
+        mime="text/csv",
     )
 
-    for _, row in profile.iterrows():
-        with st.expander(f"{row['cluster_name']} — {row['customers']:,} customers"):
-            st.write(
-                f"- Customer share: {row['customer_percentage']:.2f}%\n"
-                f"- Average recency: {row['avg_recency']:.2f} days\n"
-                f"- Average frequency: {row['avg_frequency']:.2f}\n"
-                f"- Average monetary value: {row['avg_monetary']:.2f}\n"
-                f"- Total monetary value: {row['total_monetary']:.2f}"
-            )
 
-    st.subheader("Download Results")
+# ---------------------------------------------------------------------------
+# Navigasi
+# ---------------------------------------------------------------------------
+page = st.sidebar.radio("Navigasi", ["Overview Dashboard", "Explore Dataset"])
 
-    download_left, download_right = st.columns(2)
-
-    with download_left:
-        csv_data = result.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Customer Segments (CSV)",
-            data=csv_data,
-            file_name="rfm_customer_segments.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    with download_right:
-        profile_csv = profile.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Segment Profiles (CSV)",
-            data=profile_csv,
-            file_name="rfm_segment_profiles.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    st.caption(
-        f"PCA variance explained by two components: "
-        f"{metrics['pca_variance']:.2%}."
-    )
+if page == "Overview Dashboard":
+    render_overview()
+else:
+    render_explore_dataset()
