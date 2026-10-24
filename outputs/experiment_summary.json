@@ -1,0 +1,24 @@
+{
+  "seed": 42,
+  "sklearn": "1.6.1",
+  "pandas": "2.2.3",
+  "customers": 5852,
+  "transactions": 788206,
+  "holdout_cutoff": "2011-09-10",
+  "final_model": {
+    "algorithm": "K-Means",
+    "params": {
+      "k": 4
+    },
+    "silhouette": 0.3663630756480657,
+    "davies_bouldin": 0.9293325317811632,
+    "calinski_harabasz": 5060.486132659422,
+    "stability_ari": 0.9770161897359431,
+    "eta2_future_spend": 0.26356653281796993
+  },
+  "constraints": {
+    "min_cluster_frac": 0.05,
+    "max_noise_frac": 0.1,
+    "min_stability": 0.8
+  }
+}

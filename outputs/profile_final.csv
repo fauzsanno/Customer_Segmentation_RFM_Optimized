@@ -1,0 +1,5 @@
+Cluster,Segment,Pelanggan,Recency_Median,Frequency_Median,Monetary_Median,Monetary_Mean,Monetary_Total,Pelanggan_%,Pendapatan_%,Rekomendasi aksi
+3,Active High-Value,1190,17.0,13.0,4904.98,10569.817745378152,12578083.117,20.334928229665074,73.4489136003649,"Program loyalitas/VIP, akses awal produk baru, cross-sell bernilai tinggi."
+1,At-Risk High-Value,1443,185.0,4.0,1462.78,1980.9099771309773,2858453.097,24.65823650034176,16.69175442707074,"Prioritas win-back: penawaran personal, kontak langsung, insentif terbatas waktu."
+2,Recent Low-Value,1257,24.0,3.0,720.9,845.3364216388226,1062587.882,21.479835953520162,6.204914120207173,"Dorong pembelian ke-2/3: bundling, voucher minimum belanja, rekomendasi produk."
+0,Lost / Inactive,1962,402.0,1.0,278.72,318.9688588175331,625816.901,33.526999316473,3.6544178523571698,Reaktivasi berbiaya rendah (email otomatis); hentikan bila tidak merespons.

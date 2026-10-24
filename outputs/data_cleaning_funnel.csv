@@ -1,0 +1,7 @@
+Langkah,Baris tersisa,Baris dihapus
+Data mentah (2 sheet),1067371,0
+Hapus tumpang tindih antar-sheet,1044848,22523
+Hapus Customer ID kosong,809561,235287
+Hapus invoice pembatalan (C…),791115,18446
+Hapus Quantity/Price <= 0,791045,70
+"Hapus kode non-produk (POST, M, DOT, …)",788206,2839
